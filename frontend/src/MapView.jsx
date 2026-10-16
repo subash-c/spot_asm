@@ -99,7 +99,7 @@ export default function MapView({ result, selectedId, onSelect, hour }) {
   return (
     <MapContainer center={[39.5, -96]} zoom={4} preferCanvas style={{ height: "100%", width: "100%" }}>
       <TileLayer
-        attribution='&copy; OpenStreetMap'
+        attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
         url="https://tile.openstreetmap.org/{z}/{x}/{y}.png"
       />
       {result && <HeatLayer points={result.heatmap.points} hour={hour} />}
