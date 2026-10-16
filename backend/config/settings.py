@@ -1,10 +1,12 @@
+import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = "dev-only-saferoute-key"
-DEBUG = True
+SECRET_KEY = os.environ.get("SECRET_KEY", "dev-only-saferoute-key")
+DEBUG = os.environ.get("DEBUG", "true").lower() in {"1", "true", "yes"}
 ALLOWED_HOSTS = ["*"]
+FRONTEND_DIST = os.environ.get("FRONTEND_DIST", "")
 
 INSTALLED_APPS = [
     "django.contrib.contenttypes",
