@@ -90,6 +90,7 @@ def finish(request):
             departure,
             load_lb,
             body.get("routes"),
+            body.get("weather"),
         )
     except PlannerError as exc:
         return JsonResponse({"error": str(exc)}, status=400)

@@ -1,4 +1,4 @@
-import { fetchRoutes, findPlaces } from "./providers";
+import { fetchForecast, fetchRoutes, findPlaces } from "./providers";
 
 const SERVER_TIMEOUT_MS = 90_000;
 
@@ -66,11 +66,15 @@ export async function planTrip(body) {
   if (step.status !== "ready") {
     throw new Error("No driving route was found between those places.");
   }
+  const weather = await Promise.all(
+    step.batches.map((points) => fetchForecast(points, step.forecast_days)),
+  );
   return postJson("/api/finish", {
     origin,
     destination,
     departure: body.departure,
     load_lb: body.load_lb,
     routes: step.routes,
+    weather,
   });
 }

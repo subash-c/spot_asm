@@ -23,9 +23,12 @@ from .providers import (
     METERS_PER_MILE,
     cache_get,
     cache_set,
+    chunks,
     fetch_weather,
     geocode,
+    parse_weather_row,
     request_osrm,
+    unique_points,
     weather_key,
 )
 from .risk import assess, rank_routes, summarize_checkpoints, worst
@@ -98,25 +101,44 @@ def client_prepare(origin, destination, departure, payloads):
     chosen = pick_three(candidates)[:3]
     if not chosen:
         raise PlannerError("No driving route was found between those places.")
+    batches, forecast_days = weather_inputs(chosen, departure, batched=True)
     return {
         "status": "ready",
         "routes": chosen,
+        "batches": batches,
+        "forecast_days": forecast_days,
     }
 
 
-def client_finish(origin, destination, departure, load_lb, routes):
+def client_finish(origin, destination, departure, load_lb, routes, payloads):
     routes = clean_client_routes(routes)
     if any(not route_matches_trip(route, origin, destination) for route in routes):
         raise PlannerError("The driving routes do not match the selected trip.")
-    weather_points, forecast_days = weather_inputs(routes, departure)
-    weather = fetch_weather(weather_points, forecast_days)
+    batches, _forecast_days = weather_inputs(routes, departure, batched=True)
+    if not isinstance(payloads, list) or len(payloads) != len(batches):
+        raise PlannerError("The weather service returned an unexpected result.")
+    weather = {}
+    for batch, payload in zip(batches, payloads):
+        if isinstance(payload, dict) and payload.get("error"):
+            raise PlannerError("The weather service rejected the request. Try again.")
+        rows = [payload] if isinstance(payload, dict) else payload
+        if not isinstance(rows, list) or len(rows) != len(batch):
+            raise PlannerError("The weather service returned an unexpected result.")
+        for item, row in zip(batch, rows):
+            weather[weather_key(item["lat"], item["lon"])] = parse_weather_row(row)
     return score_loaded(origin, destination, departure, load_lb, routes, weather)
 
 
-def weather_inputs(routes, departure):
+def weather_inputs(routes, departure, batched=False):
     _interval, horizon, _prepared, _grid, weather_points = collect_trip(routes, departure)
     forecast_days = forecast_window(departure, horizon)
-    return weather_points, forecast_days
+    unique = unique_points(weather_points)
+    if not batched:
+        return unique, forecast_days
+    return [
+        [{"lat": item["lat"], "lon": item["lon"]} for item in batch]
+        for batch in chunks(unique, 20)
+    ], forecast_days
 
 
 def collect_trip(routes, departure):

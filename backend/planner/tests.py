@@ -1,7 +1,5 @@
 import json
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
-
 from django.test import SimpleTestCase, override_settings
 
 from planner.geo import (
@@ -13,7 +11,7 @@ from planner.geo import (
     weather_interval_miles,
 )
 from planner.risk import assess, rain_level, rank_routes, snow_level, summarize_checkpoints, wind_level
-from planner.providers import parse_weather_row, place_label, weather_key
+from planner.providers import place_label
 from planner.services import pick_three
 
 
@@ -249,15 +247,15 @@ class BrowserPlanTests(SimpleTestCase):
         self.assertEqual(prepared.status_code, 200, prepared.content)
         step = prepared.json()
         self.assertEqual(step["status"], "ready")
-
-        with patch("planner.services.fetch_weather", side_effect=fake_weather):
-            finished = self.client.post("/api/finish", data=json.dumps({
-                "origin": body["origin"],
-                "destination": body["destination"],
-                "departure": body["departure"],
-                "load_lb": 42000,
-                "routes": step["routes"],
-            }), content_type="application/json")
+        self.assertGreaterEqual(len(step["batches"]), 1)
+        finished = self.client.post("/api/finish", data=json.dumps({
+            "origin": body["origin"],
+            "destination": body["destination"],
+            "departure": body["departure"],
+            "load_lb": 42000,
+            "routes": step["routes"],
+            "weather": [forecast_rows(len(batch)) for batch in step["batches"]],
+        }), content_type="application/json")
         self.assertEqual(finished.status_code, 200, finished.content)
         result = finished.json()
         self.assertEqual(len(result["routes"]), 1)
@@ -306,25 +304,18 @@ def future_departure():
     ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def fake_weather(points, _forecast_days):
-    departure = datetime.now(timezone.utc).replace(
-        minute=0,
-        second=0,
-        microsecond=0,
-    )
+def forecast_rows(count):
+    start = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     stamps = [
-        (departure + timedelta(hours=hour)).strftime("%Y-%m-%dT%H:%M")
-        for hour in range(72)
+        (start + timedelta(hours=hour)).strftime("%Y-%m-%dT%H:%M")
+        for hour in range(80)
     ]
-    row = parse_weather_row({
+    row = {
         "hourly": {
             "time": stamps,
             "rain": [0.0] * len(stamps),
             "snowfall": [0.0] * len(stamps),
             "wind_speed_10m": [10.0] * len(stamps),
         },
-    })
-    return {
-        weather_key(point["lat"], point["lon"]): row
-        for point in points
     }
+    return row if count == 1 else [row for _ in range(count)]

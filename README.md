@@ -21,7 +21,7 @@ npm run dev
 
 Open http://localhost:5173
 
-Vite forwards `/api` to Django on port 8000. The page asks for places and roads from the browser. Django fetches weather and scores the routes.
+Vite forwards `/api` to Django on port 8000. The page asks for places, roads, and weather from the browser. Django scores the routes.
 
 ## What you enter
 
@@ -32,7 +32,7 @@ Vite forwards `/api` to Django on port 8000. The page asks for places and roads 
 ## What it does
 
 1. Geocodes both places. Photon is asked first, then Open-Meteo.
-2. Asks OSRM for up to three driving routes. If the router returns fewer distinct roads, the app requests nearby detours so there are still choices.
+2. Asks OSRM for up to three driving routes. If OSRM is busy, it asks Valhalla instead. If the router returns fewer distinct roads, the app requests nearby detours so there are still choices.
 3. Samples weather along every route. Trips under 200 miles are checked every 10 miles, trips under 600 miles every 25 miles, and longer trips every 50 miles. All three options in one search use the same spacing, taken from the most direct route.
 4. Estimates the arrival time at each check from the route duration, then reads wind, rain, and snow for that hour from Open-Meteo.
 5. Scores each check and recommends a route.
