@@ -198,6 +198,56 @@ class ApiTests(SimpleTestCase):
         self.assertIn(services.ROUTERS[1], calls[1])
 
 
+class BrowserPlanTests(SimpleTestCase):
+    def test_browser_fetches_are_scored_without_calling_map_services(self):
+        payload = {
+            "code": "Ok",
+            "routes": [{
+                "distance": 290000,
+                "duration": 13000,
+                "geometry": {"coordinates": [[-87.63, 41.85], [-86.16, 39.77]]},
+            }],
+        }
+        body = {
+            "origin": {"label": "Chicago, Illinois, United States", "lat": 41.85, "lon": -87.63},
+            "destination": {"label": "Indianapolis, Indiana, United States", "lat": 39.77, "lon": -86.16},
+            "departure": "2026-10-17T18:00:00Z",
+            "osrm": [payload, {"code": "NoRoute"}],
+        }
+        prepared = self.client.post("/api/prepare", data=json.dumps(body), content_type="application/json")
+        self.assertEqual(prepared.status_code, 200, prepared.content)
+        step = prepared.json()
+        self.assertEqual(step["status"], "weather")
+        self.assertGreaterEqual(len(step["batches"]), 1)
+
+        weather = []
+        for batch in step["batches"]:
+            hours = ["2026-10-17T18:00", "2026-10-17T19:00"]
+            rows = [{
+                "hourly": {
+                    "time": hours,
+                    "rain": [0.0, 0.0],
+                    "snowfall": [0.0, 0.0],
+                    "wind_speed_10m": [10.0, 10.0],
+                },
+            } for _point in batch]
+            weather.append(rows[0] if len(rows) == 1 else rows)
+
+        finished = self.client.post("/api/finish", data=json.dumps({
+            "origin": body["origin"],
+            "destination": body["destination"],
+            "departure": body["departure"],
+            "load_lb": 42000,
+            "routes": step["routes"],
+            "weather": weather,
+        }), content_type="application/json")
+        self.assertEqual(finished.status_code, 200, finished.content)
+        result = finished.json()
+        self.assertEqual(len(result["routes"]), 1)
+        self.assertGreater(result["routes"][0]["checkpoints"].__len__(), 1)
+        self.assertIn("heatmap", result)
+
+
 def route(name, no_travel, severe, high, average, seconds):
     return {
         "id": name,

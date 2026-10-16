@@ -6,7 +6,7 @@ from django.http import JsonResponse
 from django.utils.dateparse import parse_datetime
 from django.views.decorators.http import require_GET, require_POST
 
-from .services import PlannerError, plan_trip, search_places
+from .services import PlannerError, client_finish, client_prepare, plan_trip, search_places
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,74 @@ def plan(request):
             status=500,
         )
     return JsonResponse(result)
+
+
+@require_POST
+def prepare(request):
+    body = read_body(request)
+    if isinstance(body, JsonResponse):
+        return body
+    try:
+        origin = clean_place(body.get("origin"), "origin")
+        destination = clean_place(body.get("destination"), "destination")
+        departure = clean_departure(body.get("departure"))
+        result = client_prepare(origin, destination, departure, body.get("osrm"))
+    except PlannerError as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+    except Exception:
+        logger.exception("prepare failed")
+        return JsonResponse(
+            {"error": "Something went wrong while planning the trip. Try again."},
+            status=500,
+        )
+    return JsonResponse(result)
+
+
+@require_POST
+def finish(request):
+    body = read_body(request)
+    if isinstance(body, JsonResponse):
+        return body
+    try:
+        origin = clean_place(body.get("origin"), "origin")
+        destination = clean_place(body.get("destination"), "destination")
+        departure = clean_departure(body.get("departure"))
+        load_lb = clean_load(body.get("load_lb"))
+        result = client_finish(
+            origin, destination, departure, load_lb, body.get("routes"), body.get("weather"),
+        )
+    except PlannerError as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+    except Exception:
+        logger.exception("finish failed")
+        return JsonResponse(
+            {"error": "Something went wrong while planning the trip. Try again."},
+            status=500,
+        )
+    return JsonResponse(result)
+
+
+def read_body(request):
+    try:
+        body = json.loads(request.body or "{}")
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Send JSON."}, status=400)
+    if not isinstance(body, dict):
+        return JsonResponse({"error": "Send JSON."}, status=400)
+    return body
+
+
+def clean_place(value, field):
+    if not isinstance(value, dict):
+        raise PlannerError(f"Enter the {field}.")
+    try:
+        lat = float(value.get("lat"))
+        lon = float(value.get("lon"))
+    except (TypeError, ValueError):
+        raise PlannerError(f"Enter the {field}.")
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        raise PlannerError(f"Enter the {field}.")
+    return {"label": clean_text(value.get("label"), field), "lat": lat, "lon": lon}
 
 
 def clean_text(value, field):

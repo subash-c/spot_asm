@@ -69,14 +69,83 @@ def plan_trip(origin_text, destination_text, departure, load_lb):
         raise PlannerError("Origin and destination are the same place.")
 
     routes = fetch_routes(origin, destination)
+    weather_points, forecast_days = weather_inputs(routes, departure)
+    weather = fetch_weather(weather_points, forecast_days)
+    result = score_loaded(origin, destination, departure, load_lb, routes, weather)
+    cache_set(plan_key, result, 10 * 60)
+    return result
+
+
+def client_prepare(origin, destination, departure, payloads):
+    """Turn browser-fetched OSRM answers into the next requests the page should make."""
+    if haversine_miles(origin["lat"], origin["lon"], destination["lat"], destination["lon"]) < 1:
+        raise PlannerError("Origin and destination are the same place.")
+    if not isinstance(payloads, list) or not payloads or len(payloads) > 6:
+        raise PlannerError("Could not read the driving routes.")
+
+    bundles = [parse_osrm_payload(payload) for payload in payloads]
+    if not bundles[0]:
+        raise PlannerError("No driving route was found between those places.")
+    bundles[0].sort(key=lambda route: route["duration_seconds"])
+    candidates = [route for bundle in bundles for route in bundle]
+
+    if len(payloads) == 1 and len(pick_three(candidates)) < 3:
+        start = {"lat": origin["lat"], "lon": origin["lon"]}
+        end = {"lat": destination["lat"], "lon": destination["lon"]}
+        calls = []
+        for lat, lon in via_points(bundles[0][0])[:3]:
+            calls.append([start, {"lat": lat, "lon": lon}, end])
+        if calls:
+            return {"status": "via", "calls": calls}
+
+    chosen = pick_three(candidates)[:3]
+    if not chosen:
+        raise PlannerError("No driving route was found between those places.")
+    batches, forecast_days = weather_inputs(chosen, departure, batched=True)
+    return {
+        "status": "weather",
+        "routes": chosen,
+        "batches": batches,
+        "forecast_days": forecast_days,
+    }
+
+
+def client_finish(origin, destination, departure, load_lb, routes, payloads):
+    routes = clean_client_routes(routes)
+    batches, _forecast_days = weather_inputs(routes, departure, batched=True)
+    if not isinstance(payloads, list) or len(payloads) != len(batches):
+        raise PlannerError("The weather service returned an unexpected result.")
+    weather = {}
+    for batch, payload in zip(batches, payloads):
+        if isinstance(payload, dict) and payload.get("error"):
+            raise PlannerError("The weather service rejected the request. Try again.")
+        rows = [payload] if isinstance(payload, dict) else payload
+        if not isinstance(rows, list) or len(rows) != len(batch):
+            raise PlannerError("The weather service returned an unexpected result.")
+        for item, row in zip(batch, rows):
+            weather[weather_key(item["lat"], item["lon"])] = parse_weather_row(row)
+    return score_loaded(origin, destination, departure, load_lb, routes, weather)
+
+
+def weather_inputs(routes, departure, batched=False):
+    _interval, horizon, _prepared, _grid, weather_points = collect_trip(routes, departure)
+    forecast_days = forecast_window(departure, horizon)
+    unique = unique_points(weather_points)
+    if not batched:
+        return unique, forecast_days
+    batches = []
+    for batch in chunks(unique, 20):
+        batches.append([{"lat": item["lat"], "lon": item["lon"]} for item in batch])
+    return batches, forecast_days
+
+
+def collect_trip(routes, departure):
     interval = weather_interval_miles(routes[0]["distance_miles"])
     horizon = departure + timedelta(hours=48)
-    for route in routes:
-        horizon = max(horizon, departure + timedelta(seconds=route["duration_seconds"]))
-
     weather_points = []
     prepared = []
     for route in routes:
+        horizon = max(horizon, departure + timedelta(seconds=route["duration_seconds"]))
         weather_samples = scale_miles(
             sample_polyline(route["coordinates"], interval),
             route["distance_miles"],
@@ -89,12 +158,13 @@ def plan_trip(origin_text, destination_text, departure, load_lb):
         for lat, lon, _mile in weather_samples:
             weather_points.append({"lat": lat, "lon": lon})
         prepared.append((route, weather_samples, display_samples))
-
     grid = corridor_points([route["coordinates"] for route in routes])
     weather_points.extend(grid)
-    forecast_days = forecast_window(departure, horizon)
-    weather = fetch_weather(weather_points, forecast_days)
+    return interval, horizon, prepared, grid, weather_points
 
+
+def score_loaded(origin, destination, departure, load_lb, routes, weather):
+    interval, _horizon, prepared, grid, _points = collect_trip(routes, departure)
     scored = []
     for index, (route, weather_samples, display_samples) in enumerate(prepared):
         scored.append(score_route(
@@ -121,7 +191,7 @@ def plan_trip(origin_text, destination_text, departure, load_lb):
     if len(ranked) < 3:
         note = f"Only {len(ranked)} distinct driving route{'s' if len(ranked) != 1 else ''} were found."
 
-    result = {
+    return {
         "origin": origin,
         "destination": destination,
         "departure": iso_z(departure),
@@ -133,8 +203,70 @@ def plan_trip(origin_text, destination_text, departure, load_lb):
         "routes": ranked,
         "heatmap": {"points": heatmap},
     }
-    cache_set(plan_key, result, 10 * 60)
-    return result
+
+
+def parse_osrm_payload(payload):
+    if not isinstance(payload, dict) or payload.get("code") != "Ok":
+        return []
+    routes = []
+    for route in payload.get("routes") or []:
+        cleaned = clean_coordinates((route.get("geometry") or {}).get("coordinates"))
+        if cleaned is None:
+            continue
+        try:
+            distance = float(route["distance"]) / METERS_PER_MILE
+            duration = float(route["duration"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if distance <= 0 or distance > 4000 or duration < 0:
+            continue
+        routes.append({
+            "coordinates": cleaned,
+            "distance_miles": distance,
+            "duration_seconds": duration,
+        })
+    return routes
+
+
+def clean_client_routes(routes):
+    if not isinstance(routes, list) or not routes or len(routes) > 3:
+        raise PlannerError("Could not read the driving routes.")
+    cleaned = []
+    for route in routes:
+        if not isinstance(route, dict):
+            raise PlannerError("Could not read the driving routes.")
+        coordinates = clean_coordinates(route.get("coordinates"))
+        try:
+            distance = float(route["distance_miles"])
+            duration = float(route["duration_seconds"])
+        except (KeyError, TypeError, ValueError):
+            raise PlannerError("Could not read the driving routes.")
+        if coordinates is None or distance <= 0 or distance > 4000 or duration < 0:
+            raise PlannerError("Could not read the driving routes.")
+        cleaned.append({
+            "coordinates": coordinates,
+            "distance_miles": distance,
+            "duration_seconds": duration,
+        })
+    return cleaned
+
+
+def clean_coordinates(coordinates):
+    if not isinstance(coordinates, list) or len(coordinates) < 2 or len(coordinates) > 15000:
+        return None
+    cleaned = []
+    for pair in coordinates:
+        if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+            return None
+        try:
+            lon = float(pair[0])
+            lat = float(pair[1])
+        except (TypeError, ValueError):
+            return None
+        if not (-180 <= lon <= 180 and -90 <= lat <= 90):
+            return None
+        cleaned.append([lon, lat])
+    return cleaned
 
 
 def score_route(route, index, weather_samples, display_samples, weather, departure, load_lb, interval):
@@ -406,7 +538,7 @@ def place_label(parts):
     return ", ".join(unique)
 
 
-def fetch_weather(points, forecast_days):
+def unique_points(points):
     unique = []
     seen = set()
     for point in points:
@@ -415,6 +547,11 @@ def fetch_weather(points, forecast_days):
             continue
         seen.add(key)
         unique.append({"key": key, "lat": point["lat"], "lon": point["lon"]})
+    return unique
+
+
+def fetch_weather(points, forecast_days):
+    unique = unique_points(points)
 
     found = {}
     missing = []

@@ -45,6 +45,7 @@ USE_I18N = True
 USE_TZ = True
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+DATA_UPLOAD_MAX_MEMORY_SIZE = 8 * 1024 * 1024
 CORS_ALLOW_ALL_ORIGINS = True
 # OpenStreetMap tile servers reject requests that arrive without a Referer.
 SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
