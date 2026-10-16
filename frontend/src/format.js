@@ -35,6 +35,17 @@ export function defaultDeparture() {
   const date = new Date();
   date.setMinutes(0, 0, 0);
   date.setHours(date.getHours() + 1);
+  return localDateTime(date);
+}
+
+export function departureBounds() {
+  const now = new Date();
+  const min = new Date(now.getTime() - 3 * 60 * 60 * 1000);
+  const max = new Date(now.getTime() + 6 * 24 * 60 * 60 * 1000);
+  return { min: localDateTime(min), max: localDateTime(max) };
+}
+
+function localDateTime(date) {
   const pad = (value) => String(value).padStart(2, "0");
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:00`;
 }

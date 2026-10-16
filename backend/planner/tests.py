@@ -1,6 +1,8 @@
 import json
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, override_settings
 
 from planner.geo import (
     corridor_points,
@@ -11,7 +13,8 @@ from planner.geo import (
     weather_interval_miles,
 )
 from planner.risk import assess, rain_level, rank_routes, snow_level, summarize_checkpoints, wind_level
-from planner.services import pick_three, place_label
+from planner.providers import parse_weather_row, place_label, weather_key
+from planner.services import pick_three
 
 
 class RiskTests(SimpleTestCase):
@@ -141,6 +144,15 @@ class ApiTests(SimpleTestCase):
         response = self.client.get("/api/plan")
         self.assertEqual(response.status_code, 405)
 
+    def test_plan_rejects_a_non_object_body(self):
+        response = self.client.post(
+            "/api/plan",
+            data="[]",
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"], "Send JSON.")
+
     def test_plan_rejects_a_missing_origin(self):
         response = self.client.post(
             "/api/plan",
@@ -159,19 +171,31 @@ class ApiTests(SimpleTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["places"], [])
 
+    @override_settings(ENABLE_SERVER_PROVIDER_API=False)
+    def test_server_provider_endpoints_are_disabled_in_production(self):
+        self.assertEqual(self.client.get("/api/places", {"q": "Chicago"}).status_code, 404)
+        self.assertEqual(
+            self.client.post(
+                "/api/plan",
+                data="{}",
+                content_type="application/json",
+            ).status_code,
+            404,
+        )
+
     def test_place_label_includes_state_and_country(self):
         label = place_label(["Chicago", "Illinois", "United States"])
         self.assertEqual(label, "Chicago, Illinois, United States")
 
     def test_router_switches_server_when_the_first_is_busy(self):
-        from planner import services
+        from planner import providers
 
         calls = []
 
         def fake(url, params=None, timeout=25, retries=1):
             calls.append(url)
-            if services.ROUTERS[0] in url:
-                raise services.PlannerError("busy")
+            if providers.ROUTERS[0] in url:
+                raise providers.PlannerError("busy")
             return {
                 "code": "Ok",
                 "routes": [{
@@ -181,25 +205,32 @@ class ApiTests(SimpleTestCase):
                 }],
             }
 
-        services.remember_router(services.ROUTERS[0])
-        services._cache.clear()
-        original = services.get_json
-        services.get_json = fake
+        providers.remember_router(providers.ROUTERS[0])
+        providers._cache.clear()
+        original = providers.get_json
+        providers.get_json = fake
         try:
-            routes = services.request_osrm([(41.8, -87.6), (39.7, -86.1)], 3)
-            again = services.request_osrm([(41.8, -87.6), (39.7, -86.1)], 3)
+            routes = providers.request_osrm(
+                [(41.8, -87.6), (39.7, -86.1)],
+                3,
+            )
+            again = providers.request_osrm(
+                [(41.8, -87.6), (39.7, -86.1)],
+                3,
+            )
         finally:
-            services.get_json = original
-            services._cache.clear()
-            services.remember_router(services.ROUTERS[0])
+            providers.get_json = original
+            providers._cache.clear()
+            providers.remember_router(providers.ROUTERS[0])
         self.assertEqual(len(routes), 1)
         self.assertEqual(len(again), 1)
         self.assertEqual(len(calls), 2)
-        self.assertIn(services.ROUTERS[1], calls[1])
+        self.assertIn(providers.ROUTERS[1], calls[1])
 
 
 class BrowserPlanTests(SimpleTestCase):
     def test_browser_fetches_are_scored_without_calling_map_services(self):
+        departure = future_departure()
         payload = {
             "code": "Ok",
             "routes": [{
@@ -211,41 +242,43 @@ class BrowserPlanTests(SimpleTestCase):
         body = {
             "origin": {"label": "Chicago, Illinois, United States", "lat": 41.85, "lon": -87.63},
             "destination": {"label": "Indianapolis, Indiana, United States", "lat": 39.77, "lon": -86.16},
-            "departure": "2026-10-17T18:00:00Z",
+            "departure": departure,
             "osrm": [payload, {"code": "NoRoute"}],
         }
         prepared = self.client.post("/api/prepare", data=json.dumps(body), content_type="application/json")
         self.assertEqual(prepared.status_code, 200, prepared.content)
         step = prepared.json()
-        self.assertEqual(step["status"], "weather")
-        self.assertGreaterEqual(len(step["batches"]), 1)
+        self.assertEqual(step["status"], "ready")
 
-        weather = []
-        for batch in step["batches"]:
-            hours = ["2026-10-17T18:00", "2026-10-17T19:00"]
-            rows = [{
-                "hourly": {
-                    "time": hours,
-                    "rain": [0.0, 0.0],
-                    "snowfall": [0.0, 0.0],
-                    "wind_speed_10m": [10.0, 10.0],
-                },
-            } for _point in batch]
-            weather.append(rows[0] if len(rows) == 1 else rows)
-
-        finished = self.client.post("/api/finish", data=json.dumps({
-            "origin": body["origin"],
-            "destination": body["destination"],
-            "departure": body["departure"],
-            "load_lb": 42000,
-            "routes": step["routes"],
-            "weather": weather,
-        }), content_type="application/json")
+        with patch("planner.services.fetch_weather", side_effect=fake_weather):
+            finished = self.client.post("/api/finish", data=json.dumps({
+                "origin": body["origin"],
+                "destination": body["destination"],
+                "departure": body["departure"],
+                "load_lb": 42000,
+                "routes": step["routes"],
+            }), content_type="application/json")
         self.assertEqual(finished.status_code, 200, finished.content)
         result = finished.json()
         self.assertEqual(len(result["routes"]), 1)
-        self.assertGreater(result["routes"][0]["checkpoints"].__len__(), 1)
+        self.assertGreater(len(result["routes"][0]["checkpoints"]), 1)
         self.assertIn("heatmap", result)
+
+    def test_finish_rejects_a_route_for_different_places(self):
+        response = self.client.post("/api/finish", data=json.dumps({
+            "origin": {"label": "Chicago", "lat": 41.85, "lon": -87.63},
+            "destination": {"label": "Indianapolis", "lat": 39.77, "lon": -86.16},
+            "departure": future_departure(),
+            "load_lb": 42000,
+            "routes": [{
+                "coordinates": [[-122.42, 37.77], [-118.24, 34.05]],
+                "distance_miles": 380,
+                "duration_seconds": 22000,
+            }],
+            "weather": [],
+        }), content_type="application/json")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("do not match", response.json()["error"])
 
 
 def route(name, no_travel, severe, high, average, seconds):
@@ -264,4 +297,34 @@ def line(lat, distance_miles):
         "coordinates": [[-87, lat], [-86, lat], [-85, lat]],
         "distance_miles": distance_miles,
         "duration_seconds": distance_miles * 60,
+    }
+
+
+def future_departure():
+    return (
+        datetime.now(timezone.utc) + timedelta(hours=2)
+    ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def fake_weather(points, _forecast_days):
+    departure = datetime.now(timezone.utc).replace(
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    stamps = [
+        (departure + timedelta(hours=hour)).strftime("%Y-%m-%dT%H:%M")
+        for hour in range(72)
+    ]
+    row = parse_weather_row({
+        "hourly": {
+            "time": stamps,
+            "rain": [0.0] * len(stamps),
+            "snowfall": [0.0] * len(stamps),
+            "wind_speed_10m": [10.0] * len(stamps),
+        },
+    })
+    return {
+        weather_key(point["lat"], point["lon"]): row
+        for point in points
     }

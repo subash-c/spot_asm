@@ -39,6 +39,7 @@ export default function PlaceField({ id, label, value, onChange }) {
         id={id}
         value={value}
         placeholder="Start typing a city"
+        maxLength={200}
         autoComplete="off"
         role="combobox"
         aria-expanded={open}

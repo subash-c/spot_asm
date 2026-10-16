@@ -1,7 +1,14 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { planTrip } from "./api";
 import PlaceField from "./PlaceField";
-import { defaultDeparture, formatDuration, formatMiles, formatWhen, hourLabel } from "./format";
+import {
+  defaultDeparture,
+  departureBounds,
+  formatDuration,
+  formatMiles,
+  formatWhen,
+  hourLabel,
+} from "./format";
 import MapView from "./MapView";
 import { RISK_COLOR, RISK_LABEL, ROUTE_COLOR } from "./risk";
 
@@ -15,13 +22,18 @@ export default function App() {
   const [result, setResult] = useState(null);
   const [selectedId, setSelectedId] = useState(null);
   const [hour, setHour] = useState(0);
+  const [departureLimits] = useState(departureBounds);
+  const requestId = useRef(0);
 
   const selected = result?.routes.find((route) => route.id === selectedId) || null;
 
   async function onSubmit(event) {
     event.preventDefault();
+    const currentRequest = ++requestId.current;
     setStatus("loading");
     setError("");
+    setResult(null);
+    setSelectedId(null);
     try {
       const data = await planTrip({
         origin,
@@ -29,11 +41,13 @@ export default function App() {
         departure: new Date(departure).toISOString(),
         load_lb: Number(loadLb),
       });
+      if (currentRequest !== requestId.current) return;
       setResult(data);
       setSelectedId(data.recommended_route_id);
       setHour(0);
       setStatus("ready");
     } catch (err) {
+      if (currentRequest !== requestId.current) return;
       setStatus("idle");
       setError(err.message);
     }
@@ -52,7 +66,15 @@ export default function App() {
           <PlaceField id="destination" label="Destination" value={destination} onChange={setDestination} />
 
           <label htmlFor="departure">Departure</label>
-          <input id="departure" type="datetime-local" value={departure} onChange={(event) => setDeparture(event.target.value)} required />
+          <input
+            id="departure"
+            type="datetime-local"
+            min={departureLimits.min}
+            max={departureLimits.max}
+            value={departure}
+            onChange={(event) => setDeparture(event.target.value)}
+            required
+          />
 
           <label htmlFor="load">Load weight (lb)</label>
           <input id="load" type="number" min="0" max="200000" step="100" value={loadLb} onChange={(event) => setLoadLb(event.target.value)} required />

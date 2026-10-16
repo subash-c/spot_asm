@@ -1,12 +1,17 @@
 import json
 import logging
 from datetime import datetime, timedelta, timezone
+from math import isfinite
 
+from django.conf import settings
 from django.http import JsonResponse
 from django.utils.dateparse import parse_datetime
+from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST
 
-from .services import PlannerError, client_finish, client_prepare, plan_trip, search_places
+from .errors import PlannerError
+from .providers import search_places
+from .services import client_finish, client_prepare, plan_trip
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +23,8 @@ def health(request):
 
 @require_GET
 def places(request):
+    if not settings.ENABLE_SERVER_PROVIDER_API:
+        return JsonResponse({"error": "Not found."}, status=404)
     try:
         found = search_places(request.GET.get("q", ""))
     except PlannerError:
@@ -25,14 +32,13 @@ def places(request):
     return JsonResponse({"places": found})
 
 
+@csrf_exempt
 @require_POST
 def plan(request):
+    if not settings.ENABLE_SERVER_PROVIDER_API:
+        return JsonResponse({"error": "Not found."}, status=404)
     try:
-        body = json.loads(request.body or "{}")
-    except json.JSONDecodeError:
-        return JsonResponse({"error": "Send JSON."}, status=400)
-
-    try:
+        body = read_body(request)
         origin = clean_text(body.get("origin"), "origin")
         destination = clean_text(body.get("destination"), "destination")
         departure = clean_departure(body.get("departure"))
@@ -49,12 +55,11 @@ def plan(request):
     return JsonResponse(result)
 
 
+@csrf_exempt
 @require_POST
 def prepare(request):
-    body = read_body(request)
-    if isinstance(body, JsonResponse):
-        return body
     try:
+        body = read_body(request)
         origin = clean_place(body.get("origin"), "origin")
         destination = clean_place(body.get("destination"), "destination")
         departure = clean_departure(body.get("departure"))
@@ -70,18 +75,21 @@ def prepare(request):
     return JsonResponse(result)
 
 
+@csrf_exempt
 @require_POST
 def finish(request):
-    body = read_body(request)
-    if isinstance(body, JsonResponse):
-        return body
     try:
+        body = read_body(request)
         origin = clean_place(body.get("origin"), "origin")
         destination = clean_place(body.get("destination"), "destination")
         departure = clean_departure(body.get("departure"))
         load_lb = clean_load(body.get("load_lb"))
         result = client_finish(
-            origin, destination, departure, load_lb, body.get("routes"), body.get("weather"),
+            origin,
+            destination,
+            departure,
+            load_lb,
+            body.get("routes"),
         )
     except PlannerError as exc:
         return JsonResponse({"error": str(exc)}, status=400)
@@ -97,10 +105,10 @@ def finish(request):
 def read_body(request):
     try:
         body = json.loads(request.body or "{}")
-    except json.JSONDecodeError:
-        return JsonResponse({"error": "Send JSON."}, status=400)
+    except json.JSONDecodeError as exc:
+        raise PlannerError("Send JSON.") from exc
     if not isinstance(body, dict):
-        return JsonResponse({"error": "Send JSON."}, status=400)
+        raise PlannerError("Send JSON.")
     return body
 
 
@@ -112,7 +120,11 @@ def clean_place(value, field):
         lon = float(value.get("lon"))
     except (TypeError, ValueError):
         raise PlannerError(f"Enter the {field}.")
-    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+    if (
+        not isfinite(lat)
+        or not isfinite(lon)
+        or not (-90 <= lat <= 90 and -180 <= lon <= 180)
+    ):
         raise PlannerError(f"Enter the {field}.")
     return {"label": clean_text(value.get("label"), field), "lat": lat, "lon": lon}
 
@@ -130,7 +142,7 @@ def clean_load(value):
         load = float(value)
     except (TypeError, ValueError):
         raise PlannerError("Enter a load weight in pounds.")
-    if load < 0 or load > 200000:
+    if not isfinite(load) or load < 0 or load > 200000:
         raise PlannerError("Load weight should be between 0 and 200,000 lb.")
     return load
 

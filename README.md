@@ -21,7 +21,7 @@ npm run dev
 
 Open http://localhost:5173
 
-Vite forwards `/api` to Django on port 8000. The page asks for places, roads, and weather from the browser, then Django scores the routes.
+Vite forwards `/api` to Django on port 8000. The page asks for places and roads from the browser. Django fetches weather and scores the routes.
 
 ## What you enter
 
@@ -67,7 +67,16 @@ Recommendation order:
 
 No-travel miles are ranked first because those stretches should not be driven.
 
-## API
+## Code structure
+
+- `frontend/src/providers.js` calls the public geocoding and routing services.
+- `frontend/src/api.js` coordinates those calls with Django's prepare and finish endpoints.
+- `backend/planner/providers.py` contains the server-side provider clients, retry logic, and short-lived cache.
+- `backend/planner/services.py` validates route data, samples each route, and builds the scored response.
+- `backend/planner/risk.py` contains the weather thresholds, load adjustments, summaries, and ranking.
+- `backend/planner/geo.py` contains geometry and sampling helpers.
+
+## Development API
 
 `POST /api/plan`
 
@@ -81,3 +90,6 @@ No-travel miles are ranked first because those stretches should not be driven.
 ```
 
 Routing, geocoding, and weather come from public services. No API key is required.
+This all-in-one provider endpoint is enabled in development and disabled in
+production to prevent a public deployment from being used as an open proxy.
+The hosted UI uses the stateless `/api/prepare` and `/api/finish` flow instead.
