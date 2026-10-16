@@ -1,5 +1,7 @@
 """Geocode a trip, fetch three driving routes, and score them with weather."""
 
+import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -22,11 +24,23 @@ from .geo import (
 )
 from .risk import assess, rank_routes, summarize_checkpoints, worst
 
+logger = logging.getLogger(__name__)
+
 USER_AGENT = "SafeRoute/1.0 (truck route planner demo)"
-SESSION = requests.Session()
-SESSION.headers["User-Agent"] = USER_AGENT
+HEADERS = {"User-Agent": USER_AGENT, "Accept": "application/json"}
 METERS_PER_MILE = 1609.344
 NAMES = ("Route A", "Route B", "Route C")
+# Public OSRM servers. The first is used until it refuses a request.
+ROUTERS = (
+    "https://routing.openstreetmap.de/routed-car",
+    "https://router.project-osrm.org",
+)
+_preferred_router = ROUTERS[0]
+_router_lock = threading.Lock()
+_cache = {}
+_cache_lock = threading.Lock()
+_nominatim_lock = threading.Lock()
+_nominatim_next = 0.0
 
 
 class PlannerError(Exception):
@@ -34,8 +48,22 @@ class PlannerError(Exception):
 
 
 def plan_trip(origin_text, destination_text, departure, load_lb):
-    origin = geocode(origin_text)
-    destination = geocode(destination_text)
+    plan_key = (
+        "plan",
+        origin_text.strip().lower(),
+        destination_text.strip().lower(),
+        departure.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+        round(float(load_lb)),
+    )
+    cached = cache_get(plan_key)
+    if cached:
+        return cached
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        origin_job = pool.submit(geocode, origin_text)
+        destination_job = pool.submit(geocode, destination_text)
+        origin = origin_job.result()
+        destination = destination_job.result()
 
     if haversine_miles(origin["lat"], origin["lon"], destination["lat"], destination["lon"]) < 1:
         raise PlannerError("Origin and destination are the same place.")
@@ -93,7 +121,7 @@ def plan_trip(origin_text, destination_text, departure, load_lb):
     if len(ranked) < 3:
         note = f"Only {len(ranked)} distinct driving route{'s' if len(ranked) != 1 else ''} were found."
 
-    return {
+    result = {
         "origin": origin,
         "destination": destination,
         "departure": iso_z(departure),
@@ -105,6 +133,8 @@ def plan_trip(origin_text, destination_text, departure, load_lb):
         "routes": ranked,
         "heatmap": {"points": heatmap},
     }
+    cache_set(plan_key, result, 10 * 60)
+    return result
 
 
 def score_route(route, index, weather_samples, display_samples, weather, departure, load_lb, interval):
@@ -156,19 +186,15 @@ def fetch_routes(origin, destination):
 
     candidates = list(direct)
     if len(pick_three(direct)) < 3:
-        extras = []
-        via_list = via_points(direct[0])
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            jobs = [
-                pool.submit(request_osrm, [start, via, end], 0)
-                for via in via_list
-            ]
-            for job in jobs:
-                try:
-                    extras.extend(job.result())
-                except PlannerError:
-                    continue
-        candidates.extend(extras)
+        # One detour at a time, and stop once three distinct roads exist.
+        # A burst of routing calls is what gets the shared demo server to refuse us.
+        for via in via_points(direct[0]):
+            if len(pick_three(candidates)) >= 3:
+                break
+            try:
+                candidates.extend(request_osrm([start, via, end], 0))
+            except PlannerError:
+                continue
 
     chosen = pick_three(candidates)
     if not chosen:
@@ -226,14 +252,37 @@ def pick_three(candidates):
 
 
 def request_osrm(places, alternatives):
+    key = ("osrm", tuple((round(lat, 4), round(lon, 4)) for lat, lon in places), int(alternatives or 0))
+    cached = cache_get(key)
+    if cached is not None:
+        return [dict(route) for route in cached]
+
     coord_text = ";".join(f"{lon:.5f},{lat:.5f}" for lat, lon in places)
-    url = f"https://router.project-osrm.org/route/v1/driving/{coord_text}"
-    payload = get_json(url, params={
+    params = {
         "alternatives": alternatives if alternatives else "false",
         "overview": "full",
         "geometries": "geojson",
         "steps": "false",
-    })
+    }
+    payload = None
+    last_error = None
+    for base in router_order():
+        try:
+            payload = get_json(f"{base}/route/v1/driving/{coord_text}", params=params, timeout=20, retries=0)
+            remember_router(base)
+            last_error = None
+            break
+        except PlannerError as exc:
+            logger.warning("router %s failed: %s", base, exc)
+            last_error = exc
+    if payload is None:
+        time.sleep(0.7)
+        base = router_order()[0]
+        try:
+            payload = get_json(f"{base}/route/v1/driving/{coord_text}", params=params, timeout=20, retries=0)
+        except PlannerError:
+            raise last_error or PlannerError("A map service is busy. Wait a moment and try again.")
+
     if payload.get("code") != "Ok":
         return []
 
@@ -247,7 +296,21 @@ def request_osrm(places, alternatives):
             "distance_miles": route["distance"] / METERS_PER_MILE,
             "duration_seconds": route["duration"],
         })
-    return routes
+    if routes:
+        cache_set(key, routes, 6 * 60 * 60)
+    return [dict(route) for route in routes]
+
+
+def router_order():
+    with _router_lock:
+        preferred = _preferred_router
+    return (preferred,) + tuple(base for base in ROUTERS if base != preferred)
+
+
+def remember_router(base):
+    global _preferred_router
+    with _router_lock:
+        _preferred_router = base
 
 
 def geocode(text):
@@ -261,9 +324,27 @@ def search_places(text, limit=5):
     text = (text or "").strip()
     if len(text) < 2:
         return []
+    key = ("places", text.lower(), limit)
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+    try:
+        places = search_photon(text, limit)
+    except PlannerError as exc:
+        logger.warning("photon failed, trying nominatim: %s", exc)
+        places = []
+    if not places:
+        places = search_nominatim(text, limit)
+    cache_set(key, places, 24 * 60 * 60 if places else 10 * 60)
+    return places
+
+
+def search_photon(text, limit):
     payload = get_json(
         "https://photon.komoot.io/api/",
         params={"q": text, "limit": limit, "lang": "en"},
+        timeout=12,
+        retries=0,
     )
     places = []
     seen = set()
@@ -280,6 +361,39 @@ def search_places(text, limit=5):
             "label": label,
             "lat": float(coordinates[1]),
             "lon": float(coordinates[0]),
+        })
+    return places
+
+
+def search_nominatim(text, limit):
+    global _nominatim_next
+    with _nominatim_lock:
+        wait = _nominatim_next - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _nominatim_next = time.monotonic() + 1.1
+    payload = get_json(
+        "https://nominatim.openstreetmap.org/search",
+        params={"q": text, "format": "jsonv2", "limit": limit, "addressdetails": 1},
+        timeout=12,
+        retries=0,
+    )
+    places = []
+    seen = set()
+    for item in payload if isinstance(payload, list) else []:
+        address = item.get("address") or {}
+        label = place_label([
+            address.get("city") or address.get("town") or address.get("village") or address.get("hamlet") or item.get("name"),
+            address.get("state"),
+            address.get("country"),
+        ])
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        places.append({
+            "label": label,
+            "lat": float(item["lat"]),
+            "lon": float(item["lon"]),
         })
     return places
 
@@ -303,7 +417,15 @@ def fetch_weather(points, forecast_days):
         unique.append({"key": key, "lat": point["lat"], "lon": point["lon"]})
 
     found = {}
-    for batch in chunks(unique, 40):
+    missing = []
+    for item in unique:
+        cached = cache_get(("wx", item["key"], forecast_days))
+        if cached is not None:
+            found[item["key"]] = cached
+        else:
+            missing.append(item)
+
+    def load_batch(batch):
         payload = get_json("https://api.open-meteo.com/v1/forecast", params={
             "latitude": ",".join(f"{item['lat']:.4f}" for item in batch),
             "longitude": ",".join(f"{item['lon']:.4f}" for item in batch),
@@ -312,14 +434,22 @@ def fetch_weather(points, forecast_days):
             "precipitation_unit": "inch",
             "timezone": "UTC",
             "forecast_days": forecast_days,
-        })
+        }, timeout=25, retries=2)
         if isinstance(payload, dict) and payload.get("error"):
             raise PlannerError("The weather service rejected the request. Try again.")
         rows = [payload] if isinstance(payload, dict) else payload
         if len(rows) != len(batch):
             raise PlannerError("The weather service returned an unexpected result.")
+        loaded = {}
         for item, row in zip(batch, rows):
-            found[item["key"]] = parse_weather_row(row)
+            parsed = parse_weather_row(row)
+            loaded[item["key"]] = parsed
+            cache_set(("wx", item["key"], forecast_days), parsed, 20 * 60)
+        return loaded
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for loaded in pool.map(load_batch, chunks(missing, 20)):
+            found.update(loaded)
     return found
 
 
@@ -401,24 +531,56 @@ def chunks(items, size):
         yield items[index:index + size]
 
 
-def get_json(url, params=None, timeout=30):
+def get_json(url, params=None, timeout=25, retries=1):
     last_error = None
-    for attempt in range(2):
+    for attempt in range(retries + 1):
         try:
-            response = SESSION.get(url, params=params, timeout=timeout)
+            response = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
         except requests.RequestException as exc:
             last_error = exc
-            time.sleep(0.8)
+            if attempt < retries:
+                time.sleep(0.4)
             continue
-        if response.status_code in (429, 500, 502, 503, 504) and attempt == 0:
-            time.sleep(1)
+        if response.status_code == 429 or response.status_code >= 500:
+            last_error = PlannerError(
+                "A map service is busy. Wait a moment and try again."
+                if response.status_code == 429
+                else "A map or weather service returned an error. Try again."
+            )
+            if attempt < retries:
+                time.sleep(0.6 if response.status_code == 429 else 0.3)
             continue
-        if response.status_code == 429:
-            raise PlannerError("A map service is busy. Wait a moment and try again.")
         if response.status_code >= 400:
             raise PlannerError("A map or weather service returned an error. Try again.")
         try:
             return response.json()
         except ValueError as exc:
             raise PlannerError("A map or weather service returned an unreadable response.") from exc
+    if isinstance(last_error, PlannerError):
+        raise last_error
     raise PlannerError("A map or weather service did not respond. Try again.") from last_error
+
+
+def cache_get(key):
+    now = time.monotonic()
+    with _cache_lock:
+        item = _cache.get(key)
+        if not item:
+            return None
+        expires, value = item
+        if expires < now:
+            _cache.pop(key, None)
+            return None
+        return value
+
+
+def cache_set(key, value, ttl):
+    now = time.monotonic()
+    with _cache_lock:
+        if len(_cache) > 500:
+            expired = [item for item, (expires, _value) in _cache.items() if expires < now]
+            for item in expired:
+                _cache.pop(item, None)
+        if len(_cache) > 500:
+            _cache.clear()
+        _cache[key] = (now + ttl, value)

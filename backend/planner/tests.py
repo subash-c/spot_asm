@@ -163,6 +163,40 @@ class ApiTests(SimpleTestCase):
         label = place_label(["Chicago", "Illinois", "United States"])
         self.assertEqual(label, "Chicago, Illinois, United States")
 
+    def test_router_switches_server_when_the_first_is_busy(self):
+        from planner import services
+
+        calls = []
+
+        def fake(url, params=None, timeout=25, retries=1):
+            calls.append(url)
+            if services.ROUTERS[0] in url:
+                raise services.PlannerError("busy")
+            return {
+                "code": "Ok",
+                "routes": [{
+                    "distance": 1609.344,
+                    "duration": 60,
+                    "geometry": {"coordinates": [[-87.6, 41.8], [-86.1, 39.7]]},
+                }],
+            }
+
+        services.remember_router(services.ROUTERS[0])
+        services._cache.clear()
+        original = services.get_json
+        services.get_json = fake
+        try:
+            routes = services.request_osrm([(41.8, -87.6), (39.7, -86.1)], 3)
+            again = services.request_osrm([(41.8, -87.6), (39.7, -86.1)], 3)
+        finally:
+            services.get_json = original
+            services._cache.clear()
+            services.remember_router(services.ROUTERS[0])
+        self.assertEqual(len(routes), 1)
+        self.assertEqual(len(again), 1)
+        self.assertEqual(len(calls), 2)
+        self.assertIn(services.ROUTERS[1], calls[1])
+
 
 def route(name, no_travel, severe, high, average, seconds):
     return {
